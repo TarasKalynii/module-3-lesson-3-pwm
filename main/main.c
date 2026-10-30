@@ -1,176 +1,471 @@
+
 #include <stdint.h>
+#include <stddef.h>
 
 #include "driver/ledc.h"
-#include "driver/gpio.h"
-#include "esp_rom_sys.h"
-#include "esp_adc/adc_oneshot.h"
+#include "esp_timer.h"
 #include "esp_err.h"
 #include "esp_log.h"
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
 
-// Потенціометр: від 60% PWM на мінімумі до 100% на максимумі.
-#define MOTOR_MIN_PERCENT    60U
-#define MOTOR_MAX_PERCENT    100U
+// ==================== НАЛАШТУВАННЯ ====================
 
-#define MOTOR_PIN           7
-#define LED_PIN             6
-#define POT_CHANNEL         ADC_CHANNEL_3  // ADC1, GPIO4
-#define LDR_CHANNEL         ADC_CHANNEL_4  // ADC1, GPIO5
-#define PWM_MODE            LEDC_LOW_SPEED_MODE
-#define MOTOR_TIMER         LEDC_TIMER_1
-#define LED_TIMER           LEDC_TIMER_0
-#define MOTOR_CHANNEL       LEDC_CHANNEL_1
-#define LED_CHANNEL         LEDC_CHANNEL_0
-#define MOTOR_FREQUENCY_HZ  20000
-#define LED_FREQUENCY_HZ    1000
-#define PWM_RESOLUTION      LEDC_TIMER_10_BIT
-#define PWM_PERIOD_TICKS    1024U
-#define PWM_MAX_DUTY        (PWM_PERIOD_TICKS - 1U)
-#define MOTOR_MIN_TICKS     ((PWM_PERIOD_TICKS * MOTOR_MIN_PERCENT + 50U) / 100U)
-#define MOTOR_MAX_TICKS     ((PWM_PERIOD_TICKS * MOTOR_MAX_PERCENT + 50U) / 100U)
-#define ADC_MAX_VALUE       4095
-#define UPDATE_PERIOD_MS    20
-#define LOG_PERIOD_MS       500
+#define BUZZER_PIN 2
+#define TICK_MS 50
 
-_Static_assert(MOTOR_MIN_PERCENT <= MOTOR_MAX_PERCENT && MOTOR_MAX_PERCENT <= 100U,
-               "Invalid motor PWM range");
+#define PWM_MODE LEDC_LOW_SPEED_MODE
+#define PWM_TIMER LEDC_TIMER_0
+#define PWM_CHANNEL LEDC_CHANNEL_0
+#define PWM_DUTY 512
 
-static const char *TAG = "hw_3_3";
-static adc_oneshot_unit_handle_t adc_handle;
+// Частоти нот (Гц)
+#define C4 262
+#define D4 294
+#define E4 330
+#define F4 349
+#define G4 392
+#define A4 440
+#define B4 494
+#define C5 523
 
-static void pwm_output_init(int pin, ledc_channel_t channel,
-                            ledc_timer_t timer, uint32_t frequency_hz,
-                            uint32_t initial_duty)
+// Тривалості (1 тік = 50 мс)
+#define E 4        // 200 мс
+#define Q 8        // 400 мс
+#define H 16       // 800 мс
+#define W 24       // 1200 мс
+
+#define NOTE_GAP 1       // 50 мс
+#define SONG_PAUSE 40    // 2000 мс
+
+#define N(f, t) {f, t}
+#define R(t) {0, t}
+#define COUNT(a) (sizeof(a) / sizeof((a)[0]))
+
+static const char *TAG = "MUSIC";
+
+// ==================== СТРУКТУРИ ====================
+
+typedef struct {
+    uint16_t frequency;
+    uint8_t duration;
+} note_t;
+
+typedef struct {
+    const char *name;
+    const note_t *notes;
+    size_t count;
+} melody_t;
+
+
+// ==================== 1. BABY SHARK ====================
+// Розширена навчальна варіація
+
+static const note_t baby_shark[] = {
+    N(C4,E), N(D4,E), N(E4,Q),
+    N(C4,E), N(D4,E), N(E4,Q),
+    N(C4,E), N(D4,E), N(E4,H),
+
+    R(E),
+
+    N(G4,Q), N(G4,E), N(A4,E),
+    N(G4,Q), N(E4,Q),
+    N(D4,E), N(C4,H),
+
+    R(E),
+
+    N(C4,E), N(D4,E), N(E4,Q),
+    N(C4,E), N(D4,E), N(E4,Q),
+    N(C4,E), N(D4,E), N(E4,H),
+
+    R(E),
+
+    N(E4,E), N(E4,E),
+    N(D4,Q), N(C4,Q),
+    N(D4,E), N(E4,E),
+    N(G4,Q), N(E4,Q),
+    N(D4,Q), N(C4,H),
+
+    R(E),
+
+    N(C4,E), N(C4,E),
+    N(D4,E), N(E4,Q),
+    N(G4,Q), N(A4,Q),
+    N(G4,Q), N(E4,Q),
+    N(D4,Q), N(C4,W)
+};
+
+
+// ==================== 2. JINGLE BELLS ====================
+// Розширений приспів
+
+static const note_t jingle_bells[] = {
+    N(E4,Q), N(E4,Q), N(E4,H),
+    R(E),
+
+    N(E4,Q), N(E4,Q), N(E4,H),
+    R(E),
+
+    N(E4,Q), N(G4,Q),
+    N(C4,Q), N(D4,Q),
+    N(E4,W),
+
+    R(E),
+
+    N(F4,Q), N(F4,Q),
+    N(F4,Q), N(F4,Q),
+    N(F4,Q), N(E4,Q),
+    N(E4,Q), N(E4,E), N(E4,E),
+    N(D4,Q), N(D4,Q),
+    N(E4,Q), N(D4,H), N(G4,H),
+
+    R(E),
+
+    N(E4,Q), N(E4,Q), N(E4,H),
+    R(E),
+
+    N(E4,Q), N(E4,Q), N(E4,H),
+    R(E),
+
+    N(E4,Q), N(G4,Q),
+    N(C4,Q), N(D4,Q),
+    N(E4,W),
+
+    R(E),
+
+    N(F4,Q), N(F4,Q),
+    N(F4,Q), N(F4,Q),
+    N(F4,Q), N(E4,Q),
+    N(E4,Q), N(E4,E), N(E4,E),
+    N(G4,Q), N(G4,Q),
+    N(F4,Q), N(D4,Q),
+    N(C4,W)
+};
+
+
+// ==================== 3. WE WILL ROCK YOU ====================
+// Розширена ритмічна варіація
+
+static const note_t we_will_rock_you[] = {
+    N(C4,E), N(C4,E), N(D4,H),
+    R(E),
+
+    N(C4,E), N(C4,E), N(D4,H),
+    R(E),
+
+    N(C4,E), N(C4,E), N(D4,Q),
+    N(E4,H),
+
+    R(Q),
+
+    N(G4,Q), N(G4,E),
+    N(F4,Q), N(E4,Q),
+    N(D4,Q), N(C4,H),
+
+    R(Q),
+
+    N(C4,E), N(C4,E), N(D4,H),
+    R(E),
+
+    N(C4,E), N(C4,E), N(D4,H),
+    R(E),
+
+    N(C4,E), N(C4,E), N(D4,Q),
+    N(E4,H),
+
+    R(Q),
+
+    N(D4,Q), N(D4,Q),
+    N(E4,Q), N(G4,Q),
+    N(F4,Q), N(E4,Q),
+    N(D4,Q), N(C4,H),
+
+    R(Q),
+
+    N(C4,E), N(C4,E), N(D4,H),
+    N(C4,E), N(C4,E), N(D4,H),
+    N(E4,Q), N(G4,Q),
+    N(E4,Q), N(D4,Q),
+    N(C4,W)
+};
+
+
+// ==================== 4. TWINKLE TWINKLE ====================
+// Повна основна мелодія
+
+static const note_t twinkle[] = {
+    // Twinkle twinkle little star
+    N(C4,Q), N(C4,Q),
+    N(G4,Q), N(G4,Q),
+    N(A4,Q), N(A4,Q),
+    N(G4,H),
+
+    // How I wonder what you are
+    N(F4,Q), N(F4,Q),
+    N(E4,Q), N(E4,Q),
+    N(D4,Q), N(D4,Q),
+    N(C4,H),
+
+    R(E),
+
+    // Up above the world so high
+    N(G4,Q), N(G4,Q),
+    N(F4,Q), N(F4,Q),
+    N(E4,Q), N(E4,Q),
+    N(D4,H),
+
+    // Like a diamond in the sky
+    N(G4,Q), N(G4,Q),
+    N(F4,Q), N(F4,Q),
+    N(E4,Q), N(E4,Q),
+    N(D4,H),
+
+    R(E),
+
+    // Twinkle twinkle little star
+    N(C4,Q), N(C4,Q),
+    N(G4,Q), N(G4,Q),
+    N(A4,Q), N(A4,Q),
+    N(G4,H),
+
+    // How I wonder what you are
+    N(F4,Q), N(F4,Q),
+    N(E4,Q), N(E4,Q),
+    N(D4,Q), N(D4,Q),
+    N(C4,W)
+};
+
+
+// ==================== 5. OLD MACDONALD ====================
+// Розширена мелодія
+
+static const note_t old_macdonald[] = {
+    N(G4,Q), N(G4,Q), N(G4,Q),
+    N(D4,Q), N(E4,Q), N(E4,Q),
+    N(D4,H),
+
+    N(B4,Q), N(B4,Q),
+    N(A4,Q), N(A4,Q),
+    N(G4,H),
+
+    R(E),
+
+    N(D4,Q), N(D4,Q),
+    N(G4,Q), N(G4,Q), N(G4,Q),
+    N(D4,Q), N(E4,Q), N(E4,Q),
+    N(D4,H),
+
+    N(B4,Q), N(B4,Q),
+    N(A4,Q), N(A4,Q),
+    N(G4,H),
+
+    R(E),
+
+    N(D4,Q), N(D4,Q),
+    N(G4,Q), N(G4,Q), N(G4,Q),
+    N(D4,Q), N(D4,Q),
+    N(G4,Q), N(G4,Q), N(G4,H),
+
+    R(E),
+
+    N(G4,E), N(G4,E),
+    N(G4,Q), N(G4,Q),
+    N(G4,E), N(G4,E),
+    N(G4,Q), N(G4,Q),
+
+    R(E),
+
+    N(G4,Q), N(G4,Q), N(G4,Q),
+    N(D4,Q), N(E4,Q), N(E4,Q),
+    N(D4,H),
+
+    N(B4,Q), N(B4,Q),
+    N(A4,Q), N(A4,Q),
+    N(G4,W)
+};
+
+
+// ==================== ПЛЕЙЛИСТ ====================
+
+static const melody_t playlist[] = {
+    {"Baby Shark", baby_shark, COUNT(baby_shark)},
+    {"Jingle Bells", jingle_bells, COUNT(jingle_bells)},
+    {"We Will Rock You", we_will_rock_you, COUNT(we_will_rock_you)},
+    {"Twinkle Twinkle", twinkle, COUNT(twinkle)},
+    {"Old MacDonald", old_macdonald, COUNT(old_macdonald)}
+};
+
+#define SONG_COUNT COUNT(playlist)
+
+
+// ==================== СТАН ПРОГРАВАЧА ====================
+
+typedef enum {
+    PLAY_NOTE,
+    NOTE_SILENCE,
+    BETWEEN_SONGS
+} player_state_t;
+
+static player_state_t state = PLAY_NOTE;
+
+static size_t song_index = 0;
+static size_t note_index = 0;
+static uint16_t ticks_left = 0;
+
+
+// ==================== ІНІЦІАЛІЗАЦІЯ ====================
+
+static void buzzer_init(void)
 {
-    const ledc_timer_config_t timer_config = {
+    ledc_timer_config_t timer = {
         .speed_mode = PWM_MODE,
-        .duty_resolution = PWM_RESOLUTION,
-        .timer_num = timer,
-        .freq_hz = frequency_hz,
-        .clk_cfg = LEDC_AUTO_CLK,
+        .timer_num = PWM_TIMER,
+        .duty_resolution = LEDC_TIMER_10_BIT,
+        .freq_hz = C4,
+        .clk_cfg = LEDC_AUTO_CLK
     };
-    ESP_ERROR_CHECK(ledc_timer_config(&timer_config));
 
-    const ledc_channel_config_t channel_config = {
-        .gpio_num = pin,
+    ESP_ERROR_CHECK(ledc_timer_config(&timer));
+
+    ledc_channel_config_t channel = {
+        .gpio_num = BUZZER_PIN,
         .speed_mode = PWM_MODE,
-        .channel = channel,
+        .channel = PWM_CHANNEL,
         .intr_type = LEDC_INTR_DISABLE,
-        .timer_sel = timer,
-        .duty = initial_duty,
-        .hpoint = 0,
+        .timer_sel = PWM_TIMER,
+        .duty = 0,
+        .hpoint = 0
     };
-    ESP_ERROR_CHECK(ledc_channel_config(&channel_config));
+
+    ESP_ERROR_CHECK(ledc_channel_config(&channel));
 }
 
-static void adc_inputs_init(void)
-{
-    const adc_oneshot_unit_init_cfg_t unit_config = {
-        .unit_id = ADC_UNIT_1,
-    };
-    ESP_ERROR_CHECK(adc_oneshot_new_unit(&unit_config, &adc_handle));
 
-    const adc_oneshot_chan_cfg_t channel_config = {
-        .atten = ADC_ATTEN_DB_12,
-        .bitwidth = ADC_BITWIDTH_12,
-    };
-    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc_handle, POT_CHANNEL,
-                                             &channel_config));
-    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc_handle, LDR_CHANNEL,
-                                             &channel_config));
+// ==================== КЕРУВАННЯ ЗВУКОМ ====================
+
+static void buzzer_stop(void)
+{
+    ESP_ERROR_CHECK(ledc_set_duty(
+        PWM_MODE, PWM_CHANNEL, 0
+    ));
+
+    ESP_ERROR_CHECK(ledc_update_duty(
+        PWM_MODE, PWM_CHANNEL
+    ));
 }
 
-static uint32_t ldr_to_led_duty(int value)
+static void buzzer_play(uint16_t frequency)
 {
-    if (value < 0) {
-        value = 0;
-    } else if (value > ADC_MAX_VALUE) {
-        value = ADC_MAX_VALUE;
+    if (frequency == 0) {
+        buzzer_stop();
+        return;
     }
-    return PWM_MAX_DUTY - (uint32_t)value * PWM_MAX_DUTY / ADC_MAX_VALUE;
+
+    ESP_ERROR_CHECK(ledc_set_freq(
+        PWM_MODE, PWM_TIMER, frequency
+    ));
+
+    ESP_ERROR_CHECK(ledc_set_duty(
+        PWM_MODE, PWM_CHANNEL, PWM_DUTY
+    ));
+
+    ESP_ERROR_CHECK(ledc_update_duty(
+        PWM_MODE, PWM_CHANNEL
+    ));
 }
 
-// Коротка діагностична вибірка самого GPIO, не вимірювач обертів.
-static unsigned motor_high_samples(void)
+
+// ==================== МУЗИЧНИЙ ТАЙМЕР ====================
+
+static void music_tick(void *arg)
 {
-    unsigned high = 0;
-    for (unsigned i = 0; i < 256; ++i) {
-        high += gpio_get_level(MOTOR_PIN) != 0;
-        esp_rom_delay_us(1 + i % 13);
+    (void)arg;
+
+    const melody_t *song = &playlist[song_index];
+
+    // Початок нового етапу
+    if (ticks_left == 0) {
+
+        switch (state) {
+
+            case PLAY_NOTE: {
+                const note_t *note = &song->notes[note_index];
+
+                if (note_index == 0) {
+                    ESP_LOGI(TAG, "Playing: %s", song->name);
+                }
+
+                buzzer_play(note->frequency);
+                ticks_left = note->duration;
+                break;
+            }
+
+            case NOTE_SILENCE:
+                buzzer_stop();
+                ticks_left = NOTE_GAP;
+                break;
+
+            case BETWEEN_SONGS:
+                buzzer_stop();
+                ESP_LOGI(TAG, "Finished: %s", song->name);
+                ticks_left = SONG_PAUSE;
+                break;
+        }
     }
-    return high;
+
+    // Один тік = 50 мс
+    ticks_left--;
+
+    if (ticks_left > 0) {
+        return;
+    }
+
+    // Визначаємо наступний етап
+    switch (state) {
+
+        case PLAY_NOTE:
+            state = NOTE_SILENCE;
+            break;
+
+        case NOTE_SILENCE:
+            note_index++;
+
+            if (note_index >= song->count) {
+                state = BETWEEN_SONGS;
+            } else {
+                state = PLAY_NOTE;
+            }
+            break;
+
+        case BETWEEN_SONGS:
+            song_index = (song_index + 1) % SONG_COUNT;
+            note_index = 0;
+            state = PLAY_NOTE;
+            break;
+    }
 }
 
-static uint32_t pot_to_motor_duty(int value)
-{
-    if (value < 0) {
-        value = 0;
-    } else if (value > ADC_MAX_VALUE) {
-        value = ADC_MAX_VALUE;
-    }
-    const uint32_t span = MOTOR_MAX_TICKS - MOTOR_MIN_TICKS;
-    return MOTOR_MIN_TICKS + ((uint32_t)value * span + ADC_MAX_VALUE / 2U) / ADC_MAX_VALUE;
-}
 
-static void motor_set_duty(uint32_t duty)
-{
-    if (duty >= PWM_PERIOD_TICKS) {
-        ESP_ERROR_CHECK(ledc_stop(PWM_MODE, MOTOR_CHANNEL, 1));
-    } else {
-        ESP_ERROR_CHECK(ledc_set_duty(PWM_MODE, MOTOR_CHANNEL, duty));
-        ESP_ERROR_CHECK(ledc_update_duty(PWM_MODE, MOTOR_CHANNEL));
-    }
-}
+// ==================== APP MAIN ====================
 
 void app_main(void)
 {
-    pwm_output_init(MOTOR_PIN, MOTOR_CHANNEL, MOTOR_TIMER,
-                    MOTOR_FREQUENCY_HZ, MOTOR_MIN_TICKS);
-    ESP_ERROR_CHECK(gpio_input_enable(MOTOR_PIN));
-    pwm_output_init(LED_PIN, LED_CHANNEL, LED_TIMER, LED_FREQUENCY_HZ, 0);
-    adc_inputs_init();
+    buzzer_init();
 
-    ESP_LOGI(TAG, "POT GPIO4 -> MOTOR GPIO7: %u..%u%% PWM; LDR GPIO5 -> LED GPIO6",
-             (unsigned)MOTOR_MIN_PERCENT, (unsigned)MOTOR_MAX_PERCENT);
-    ESP_LOGI(TAG, "Motor %u Hz, LED %u Hz",
-             (unsigned)ledc_get_freq(PWM_MODE, MOTOR_TIMER),
-             (unsigned)ledc_get_freq(PWM_MODE, LED_TIMER));
+    esp_timer_handle_t music_timer;
 
-    uint32_t motor_duty = MOTOR_MIN_TICKS;
-    TickType_t last_log = xTaskGetTickCount();
-    while (1) {
-        int pot_value = 0;
-        int ldr_value = 0;
-        esp_err_t pot_result = adc_oneshot_read(adc_handle, POT_CHANNEL, &pot_value);
-        esp_err_t ldr_result = adc_oneshot_read(adc_handle, LDR_CHANNEL, &ldr_value);
+    esp_timer_create_args_t timer_args = {
+        .callback = music_tick,
+        .arg = NULL,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name = "music_timer"
+    };
 
-        // Потенціометр впливає лише на двигун; помилка його ADC вимикає двигун.
-        uint32_t target = pot_result == ESP_OK ? pot_to_motor_duty(pot_value) : 0;
-        if (target != motor_duty) {
-            motor_set_duty(target);
-            motor_duty = target;
-        }
-        // Фоторезистор впливає лише на LED: темніше -> яскравіше.
-        uint32_t led_duty = ldr_result == ESP_OK ? ldr_to_led_duty(ldr_value) : 0;
-        ESP_ERROR_CHECK(ledc_set_duty(PWM_MODE, LED_CHANNEL, led_duty));
-        ESP_ERROR_CHECK(ledc_update_duty(PWM_MODE, LED_CHANNEL));
+    ESP_ERROR_CHECK(esp_timer_create(
+        &timer_args, &music_timer
+    ));
 
-        TickType_t now = xTaskGetTickCount();
-        if ((TickType_t)(now - last_log) >= pdMS_TO_TICKS(LOG_PERIOD_MS)) {
-            ESP_LOGI(TAG, "POT_GPIO4=%d MOTOR_GPIO7=%u/1024 (%u%%) PIN7_HIGH=%u/256 "
-                     "LDR_GPIO5=%d LED_GPIO6=%u/1023",
-                     pot_value, (unsigned)motor_duty,
-                     (unsigned)((motor_duty * 100U + PWM_PERIOD_TICKS / 2U) / PWM_PERIOD_TICKS),
-                     motor_high_samples(), ldr_value, (unsigned)led_duty);
-            if (pot_result != ESP_OK) {
-                ESP_LOGW(TAG, "POT ADC read failed: %s", esp_err_to_name(pot_result));
-            }
-            if (ldr_result != ESP_OK) {
-                ESP_LOGW(TAG, "LDR ADC read failed: %s", esp_err_to_name(ldr_result));
-            }
-            last_log = now;
-        }
-        vTaskDelay(pdMS_TO_TICKS(UPDATE_PERIOD_MS));
-    }
+    ESP_ERROR_CHECK(esp_timer_start_periodic(
+        music_timer, TICK_MS * 1000
+    ));
+
+    ESP_LOGI(TAG, "Music player started on GPIO2");
 }
