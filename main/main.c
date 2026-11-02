@@ -1,176 +1,118 @@
 #include <stdint.h>
-
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "driver/ledc.h"
-#include "driver/gpio.h"
-#include "esp_rom_sys.h"
 #include "esp_adc/adc_oneshot.h"
 #include "esp_err.h"
 #include "esp_log.h"
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
 
-// Потенціометр: від 60% PWM на мінімумі до 100% на максимумі.
-#define MOTOR_MIN_PERCENT    60U
-#define MOTOR_MAX_PERCENT    100U
+static const char *TAG = "SERVO";
 
-#define MOTOR_PIN           7
-#define LED_PIN             6
-#define POT_CHANNEL         ADC_CHANNEL_3  // ADC1, GPIO4
-#define LDR_CHANNEL         ADC_CHANNEL_4  // ADC1, GPIO5
-#define PWM_MODE            LEDC_LOW_SPEED_MODE
-#define MOTOR_TIMER         LEDC_TIMER_1
-#define LED_TIMER           LEDC_TIMER_0
-#define MOTOR_CHANNEL       LEDC_CHANNEL_1
-#define LED_CHANNEL         LEDC_CHANNEL_0
-#define MOTOR_FREQUENCY_HZ  20000
-#define LED_FREQUENCY_HZ    1000
-#define PWM_RESOLUTION      LEDC_TIMER_10_BIT
-#define PWM_PERIOD_TICKS    1024U
-#define PWM_MAX_DUTY        (PWM_PERIOD_TICKS - 1U)
-#define MOTOR_MIN_TICKS     ((PWM_PERIOD_TICKS * MOTOR_MIN_PERCENT + 50U) / 100U)
-#define MOTOR_MAX_TICKS     ((PWM_PERIOD_TICKS * MOTOR_MAX_PERCENT + 50U) / 100U)
-#define ADC_MAX_VALUE       4095
-#define UPDATE_PERIOD_MS    20
-#define LOG_PERIOD_MS       500
+/* Потенціометр: крайні контакти — 3V3 і GND, середній — GPIO1. */
+#define POT_GPIO            1
+#define POT_ADC_MAX         4095
+#define POT_SAMPLES         16
+#define UPDATE_MS           20
+#define DUTY_DEADBAND       4
 
-_Static_assert(MOTOR_MIN_PERCENT <= MOTOR_MAX_PERCENT && MOTOR_MAX_PERCENT <= 100U,
-               "Invalid motor PWM range");
+/* Сигнал сервоприводу залишається на GPIO4. */
+#define SERVO_GPIO          4
+#define SERVO_TIMER         LEDC_TIMER_0
+#define SERVO_CHANNEL       LEDC_CHANNEL_0
+#define SERVO_MODE          LEDC_LOW_SPEED_MODE
+#define SERVO_FREQ_HZ       50
+#define SERVO_RES           LEDC_TIMER_14_BIT
+#define SERVO_DUTY_MAX      ((1 << 14) - 1)
+#define SERVO_PERIOD_US     20000
+#define SERVO_MIN_US        500
+#define SERVO_MAX_US        2400
+#define DUTY_MIN            ((SERVO_MIN_US * SERVO_DUTY_MAX) / SERVO_PERIOD_US)
+#define DUTY_MAX            ((SERVO_MAX_US * SERVO_DUTY_MAX) / SERVO_PERIOD_US)
 
-static const char *TAG = "hw_3_3";
-static adc_oneshot_unit_handle_t adc_handle;
+static adc_oneshot_unit_handle_t pot_adc;
+static adc_channel_t pot_channel;
 
-static void pwm_output_init(int pin, ledc_channel_t channel,
-                            ledc_timer_t timer, uint32_t frequency_hz,
-                            uint32_t initial_duty)
+static void pot_init(void)
 {
-    const ledc_timer_config_t timer_config = {
-        .speed_mode = PWM_MODE,
-        .duty_resolution = PWM_RESOLUTION,
-        .timer_num = timer,
-        .freq_hz = frequency_hz,
-        .clk_cfg = LEDC_AUTO_CLK,
-    };
-    ESP_ERROR_CHECK(ledc_timer_config(&timer_config));
+    adc_unit_t unit;
+    ESP_ERROR_CHECK(adc_oneshot_io_to_channel(POT_GPIO, &unit, &pot_channel));
 
-    const ledc_channel_config_t channel_config = {
-        .gpio_num = pin,
-        .speed_mode = PWM_MODE,
-        .channel = channel,
-        .intr_type = LEDC_INTR_DISABLE,
-        .timer_sel = timer,
-        .duty = initial_duty,
-        .hpoint = 0,
+    adc_oneshot_unit_init_cfg_t unit_cfg = {
+        .unit_id = unit,
     };
-    ESP_ERROR_CHECK(ledc_channel_config(&channel_config));
-}
+    ESP_ERROR_CHECK(adc_oneshot_new_unit(&unit_cfg, &pot_adc));
 
-static void adc_inputs_init(void)
-{
-    const adc_oneshot_unit_init_cfg_t unit_config = {
-        .unit_id = ADC_UNIT_1,
-    };
-    ESP_ERROR_CHECK(adc_oneshot_new_unit(&unit_config, &adc_handle));
-
-    const adc_oneshot_chan_cfg_t channel_config = {
+    adc_oneshot_chan_cfg_t channel_cfg = {
         .atten = ADC_ATTEN_DB_12,
         .bitwidth = ADC_BITWIDTH_12,
     };
-    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc_handle, POT_CHANNEL,
-                                             &channel_config));
-    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc_handle, LDR_CHANNEL,
-                                             &channel_config));
+    ESP_ERROR_CHECK(adc_oneshot_config_channel(pot_adc, pot_channel, &channel_cfg));
 }
 
-static uint32_t ldr_to_led_duty(int value)
+static int pot_read(void)
 {
-    if (value < 0) {
-        value = 0;
-    } else if (value > ADC_MAX_VALUE) {
-        value = ADC_MAX_VALUE;
+    int sum = 0;
+    for (int i = 0; i < POT_SAMPLES; ++i) {
+        int raw;
+        ESP_ERROR_CHECK(adc_oneshot_read(pot_adc, pot_channel, &raw));
+        sum += raw;
     }
-    return PWM_MAX_DUTY - (uint32_t)value * PWM_MAX_DUTY / ADC_MAX_VALUE;
+    return sum / POT_SAMPLES;
 }
 
-// Коротка діагностична вибірка самого GPIO, не вимірювач обертів.
-static unsigned motor_high_samples(void)
+static int pot_to_duty(int raw)
 {
-    unsigned high = 0;
-    for (unsigned i = 0; i < 256; ++i) {
-        high += gpio_get_level(MOTOR_PIN) != 0;
-        esp_rom_delay_us(1 + i % 13);
-    }
-    return high;
+    return DUTY_MIN + (raw * (DUTY_MAX - DUTY_MIN)) / POT_ADC_MAX;
 }
 
-static uint32_t pot_to_motor_duty(int value)
+static void servo_init(int initial_duty)
 {
-    if (value < 0) {
-        value = 0;
-    } else if (value > ADC_MAX_VALUE) {
-        value = ADC_MAX_VALUE;
-    }
-    const uint32_t span = MOTOR_MAX_TICKS - MOTOR_MIN_TICKS;
-    return MOTOR_MIN_TICKS + ((uint32_t)value * span + ADC_MAX_VALUE / 2U) / ADC_MAX_VALUE;
-}
+    ledc_timer_config_t timer = {
+        .speed_mode = SERVO_MODE,
+        .timer_num = SERVO_TIMER,
+        .duty_resolution = SERVO_RES,
+        .freq_hz = SERVO_FREQ_HZ,
+        .clk_cfg = LEDC_AUTO_CLK,
+    };
+    ESP_ERROR_CHECK(ledc_timer_config(&timer));
 
-static void motor_set_duty(uint32_t duty)
-{
-    if (duty >= PWM_PERIOD_TICKS) {
-        ESP_ERROR_CHECK(ledc_stop(PWM_MODE, MOTOR_CHANNEL, 1));
-    } else {
-        ESP_ERROR_CHECK(ledc_set_duty(PWM_MODE, MOTOR_CHANNEL, duty));
-        ESP_ERROR_CHECK(ledc_update_duty(PWM_MODE, MOTOR_CHANNEL));
-    }
+    ledc_channel_config_t channel = {
+        .gpio_num = SERVO_GPIO,
+        .speed_mode = SERVO_MODE,
+        .channel = SERVO_CHANNEL,
+        .timer_sel = SERVO_TIMER,
+        .duty = (uint32_t)initial_duty,
+        .hpoint = 0,
+    };
+    ESP_ERROR_CHECK(ledc_channel_config(&channel));
 }
 
 void app_main(void)
 {
-    pwm_output_init(MOTOR_PIN, MOTOR_CHANNEL, MOTOR_TIMER,
-                    MOTOR_FREQUENCY_HZ, MOTOR_MIN_TICKS);
-    ESP_ERROR_CHECK(gpio_input_enable(MOTOR_PIN));
-    pwm_output_init(LED_PIN, LED_CHANNEL, LED_TIMER, LED_FREQUENCY_HZ, 0);
-    adc_inputs_init();
+    pot_init();
+    int filtered = pot_read();
+    int duty = pot_to_duty(filtered);
+    servo_init(duty);
+    ESP_LOGI(TAG, "Потенціометр GPIO%d -> серво GPIO%d, duty %d..%d",
+             POT_GPIO, SERVO_GPIO, DUTY_MIN, DUTY_MAX);
 
-    ESP_LOGI(TAG, "POT GPIO4 -> MOTOR GPIO7: %u..%u%% PWM; LDR GPIO5 -> LED GPIO6",
-             (unsigned)MOTOR_MIN_PERCENT, (unsigned)MOTOR_MAX_PERCENT);
-    ESP_LOGI(TAG, "Motor %u Hz, LED %u Hz",
-             (unsigned)ledc_get_freq(PWM_MODE, MOTOR_TIMER),
-             (unsigned)ledc_get_freq(PWM_MODE, LED_TIMER));
-
-    uint32_t motor_duty = MOTOR_MIN_TICKS;
     TickType_t last_log = xTaskGetTickCount();
     while (1) {
-        int pot_value = 0;
-        int ldr_value = 0;
-        esp_err_t pot_result = adc_oneshot_read(adc_handle, POT_CHANNEL, &pot_value);
-        esp_err_t ldr_result = adc_oneshot_read(adc_handle, LDR_CHANNEL, &ldr_value);
-
-        // Потенціометр впливає лише на двигун; помилка його ADC вимикає двигун.
-        uint32_t target = pot_result == ESP_OK ? pot_to_motor_duty(pot_value) : 0;
-        if (target != motor_duty) {
-            motor_set_duty(target);
-            motor_duty = target;
+        /* Усереднення та фільтр зменшують тремтіння від шуму АЦП. */
+        filtered += (pot_read() - filtered) / 4;
+        int target = pot_to_duty(filtered);
+        int delta = target - duty;
+        if (delta >= DUTY_DEADBAND || delta <= -DUTY_DEADBAND) {
+            duty = target;
+            ESP_ERROR_CHECK(ledc_set_duty(SERVO_MODE, SERVO_CHANNEL, (uint32_t)duty));
+            ESP_ERROR_CHECK(ledc_update_duty(SERVO_MODE, SERVO_CHANNEL));
         }
-        // Фоторезистор впливає лише на LED: темніше -> яскравіше.
-        uint32_t led_duty = ldr_result == ESP_OK ? ldr_to_led_duty(ldr_value) : 0;
-        ESP_ERROR_CHECK(ledc_set_duty(PWM_MODE, LED_CHANNEL, led_duty));
-        ESP_ERROR_CHECK(ledc_update_duty(PWM_MODE, LED_CHANNEL));
 
         TickType_t now = xTaskGetTickCount();
-        if ((TickType_t)(now - last_log) >= pdMS_TO_TICKS(LOG_PERIOD_MS)) {
-            ESP_LOGI(TAG, "POT_GPIO4=%d MOTOR_GPIO7=%u/1024 (%u%%) PIN7_HIGH=%u/256 "
-                     "LDR_GPIO5=%d LED_GPIO6=%u/1023",
-                     pot_value, (unsigned)motor_duty,
-                     (unsigned)((motor_duty * 100U + PWM_PERIOD_TICKS / 2U) / PWM_PERIOD_TICKS),
-                     motor_high_samples(), ldr_value, (unsigned)led_duty);
-            if (pot_result != ESP_OK) {
-                ESP_LOGW(TAG, "POT ADC read failed: %s", esp_err_to_name(pot_result));
-            }
-            if (ldr_result != ESP_OK) {
-                ESP_LOGW(TAG, "LDR ADC read failed: %s", esp_err_to_name(ldr_result));
-            }
+        if (now - last_log >= pdMS_TO_TICKS(500)) {
+            ESP_LOGI(TAG, "ADC: %d / %d, duty: %d", filtered, POT_ADC_MAX, duty);
             last_log = now;
         }
-        vTaskDelay(pdMS_TO_TICKS(UPDATE_PERIOD_MS));
+        vTaskDelay(pdMS_TO_TICKS(UPDATE_MS));
     }
 }
