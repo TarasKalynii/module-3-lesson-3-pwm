@@ -1,0 +1,13 @@
+Витяг зі скриншота користувача від 06.11.2026 (не прямий запис serial monitor).
+
+I (2947816) SAFE: Digit 4 confirmed: 2
+I (2947816) SAFE: Checking PIN...
+ENTERED PIN: 4522
+E (2947816) SAFE: ACCESS DENIED!
+W (2947816) SAFE: WRONG PIN OR RESET
+W (2947816) SAFE: Attempts used: 1/3
+I (2947826) SAFE: NEW ATTEMPT: 2/3
+I (2947826) SAFE: Rotate encoder to enter PIN
+I (2947826) SAFE: Change direction to confirm digit
+PIN: 0
+I (2950356) SAFE: HEARTBEAT | State=ENTERING_PIN | A=1 B=1 SW=1 | Attempts used=1/3

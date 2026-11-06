@@ -1,0 +1,8 @@
+{
+  "idf.port": "/dev/cu.usbmodem1101",
+  "idf.monitorPort": "/dev/cu.usbmodem1101",
+  "idf.flashType": "UART",
+  "idf.saveBeforeBuild": true,
+  "task.saveBeforeRun": "always",
+  "idf.customTask": "/bin/bash ${workspaceFolder}/tools/idf.sh flash-monitor"
+}
