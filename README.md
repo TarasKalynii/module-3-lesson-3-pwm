@@ -64,6 +64,20 @@ bash tools/idf.sh flash-monitor
 відкриття закриває сейф і відновлює спроби. HEARTBEAT продовжується.
 Деталі та витяги логів: [docs/results.md](docs/results.md).
 
+### Правильний PIN — доступ надано
+
+На скриншоті: введення 1234, ACCESS GRANTED, команда сервоприводу 90°,
+стан OPEN та подальші повідомлення HEARTBEAT.
+
+![Правильний PIN 1234: ACCESS GRANTED і SAFE OPENED](docs/screenshots/access-granted.png)
+
+### Неправильний PIN — доступ відхилено
+
+На скриншоті: введення 4522, ACCESS DENIED, використано одну спробу з трьох,
+початок другої спроби та продовження HEARTBEAT.
+
+![Неправильний PIN 4522: ACCESS DENIED і нова спроба](docs/screenshots/access-denied.png)
+
 Для відтворення встанови ESP-IDF 6.1. Основний код є переносимим; допоміжний
 скрипт автоматичного прошивання розрахований на macOS та конкретну USB-плату
 із серійним номером E8:3D:C1:F2:9D:A4. Для іншої плати адаптуй BOARD_SERIAL
