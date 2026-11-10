@@ -1,12 +1,12 @@
 #include <inttypes.h>
 #include <stdint.h>
+#include <stdio.h>
 
 #include "driver/ledc.h"
 #include "esp_adc/adc_cali.h"
 #include "esp_adc/adc_cali_scheme.h"
 #include "esp_adc/adc_oneshot.h"
 #include "esp_err.h"
-#include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -33,9 +33,8 @@ enum {
     SERVO_MIN_PULSE_US = 1000,
     SERVO_MAX_PULSE_US = 2000,
     SAMPLE_INTERVAL_MS = 100,
+    LOG_INTERVAL_SAMPLES = 5,
 };
-
-static const char *TAG = "LDR_SERVO";
 
 static void init_light_sensor(adc_oneshot_unit_handle_t *adc, adc_cali_handle_t *calibration)
 {
@@ -118,27 +117,38 @@ static uint32_t pulse_to_duty(uint32_t pulse_us)
 
 void app_main(void)
 {
+    setvbuf(stdout, NULL, _IONBF, 0);
+    puts("\n[LDR_SERVO] START: ESP32-S3 LDR and servo demo");
+
     adc_oneshot_unit_handle_t adc;
     adc_cali_handle_t calibration;
+    puts("[LDR_SERVO] Initializing ADC on GPIO9...");
     init_light_sensor(&adc, &calibration);
+    puts("[LDR_SERVO] ADC ready; initializing PWM on GPIO14...");
     init_servo();
+    puts("[LDR_SERVO] READY: reading the light sensor and driving the servo");
 
-    ESP_LOGI(TAG, "LDR: GPIO9 (ADC1_CH8), servo: GPIO14 (50 Hz)");
-
+    uint32_t sample_number = 0;
     while (true) {
         int raw;
         int millivolts;
+        const bool log_sample = sample_number++ % LOG_INTERVAL_SAMPLES == 0;
         esp_err_t error = read_light(adc, calibration, &raw, &millivolts);
         if (error == ESP_OK) {
             const int angle = light_to_angle(millivolts);
             const uint32_t pulse_us = angle_to_pulse_us(angle);
             const uint32_t duty = pulse_to_duty(pulse_us);
 
-            ESP_ERROR_CHECK(ledc_set_duty_and_update(SERVO_MODE, SERVO_CHANNEL, duty, 0));
-            ESP_LOGI(TAG, "raw=%d voltage=%d mV angle=%d deg pulse=%" PRIu32 " us duty=%" PRIu32,
-                     raw, millivolts, angle, pulse_us, duty);
-        } else {
-            ESP_LOGW(TAG, "ADC sample skipped: %s", esp_err_to_name(error));
+            ESP_ERROR_CHECK(ledc_set_duty(SERVO_MODE, SERVO_CHANNEL, duty));
+            ESP_ERROR_CHECK(ledc_update_duty(SERVO_MODE, SERVO_CHANNEL));
+            if (log_sample) {
+                printf("[LDR_SERVO] sample=%" PRIu32 " raw=%d voltage=%d mV angle=%d deg "
+                       "pulse=%" PRIu32 " us duty=%" PRIu32 "\n",
+                       sample_number, raw, millivolts, angle, pulse_us, duty);
+            }
+        } else if (log_sample) {
+            printf("[LDR_SERVO] sample=%" PRIu32 " ADC error: %s\n",
+                   sample_number, esp_err_to_name(error));
         }
         vTaskDelay(pdMS_TO_TICKS(SAMPLE_INTERVAL_MS));
     }
