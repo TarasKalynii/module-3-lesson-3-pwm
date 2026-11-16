@@ -13,4 +13,8 @@ idf.py set-target esp32s3
 idf.py -p PORT flash monitor
 ```
 
-[Результат перевірки](docs/results.md).
+## Результат роботи
+
+![Годинник на макетній платі. OLED показує час і дату](docs/i2c-clock.jpg)
+
+[Журнал перевірки](docs/results.md).
