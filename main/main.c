@@ -1,176 +1,279 @@
+#include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include <time.h>
 
-#include "driver/ledc.h"
-#include "driver/gpio.h"
-#include "esp_rom_sys.h"
-#include "esp_adc/adc_oneshot.h"
+#include "driver/i2c_master.h"
 #include "esp_err.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
-// Потенціометр: від 60% PWM на мінімумі до 100% на максимумі.
-#define MOTOR_MIN_PERCENT    60U
-#define MOTOR_MAX_PERCENT    100U
+#define RTC_ADDRESS  0x68
+#define OLED_ADDRESS 0x3C
+#define SDA_PIN      GPIO_NUM_6
+#define SCL_PIN      GPIO_NUM_7
+#define I2C_SPEED_HZ 100000
+#define I2C_TIMEOUT_MS 200
 
-#define MOTOR_PIN           7
-#define LED_PIN             6
-#define POT_CHANNEL         ADC_CHANNEL_3  // ADC1, GPIO4
-#define LDR_CHANNEL         ADC_CHANNEL_4  // ADC1, GPIO5
-#define PWM_MODE            LEDC_LOW_SPEED_MODE
-#define MOTOR_TIMER         LEDC_TIMER_1
-#define LED_TIMER           LEDC_TIMER_0
-#define MOTOR_CHANNEL       LEDC_CHANNEL_1
-#define LED_CHANNEL         LEDC_CHANNEL_0
-#define MOTOR_FREQUENCY_HZ  20000
-#define LED_FREQUENCY_HZ    1000
-#define PWM_RESOLUTION      LEDC_TIMER_10_BIT
-#define PWM_PERIOD_TICKS    1024U
-#define PWM_MAX_DUTY        (PWM_PERIOD_TICKS - 1U)
-#define MOTOR_MIN_TICKS     ((PWM_PERIOD_TICKS * MOTOR_MIN_PERCENT + 50U) / 100U)
-#define MOTOR_MAX_TICKS     ((PWM_PERIOD_TICKS * MOTOR_MAX_PERCENT + 50U) / 100U)
-#define ADC_MAX_VALUE       4095
-#define UPDATE_PERIOD_MS    20
-#define LOG_PERIOD_MS       500
+#define OLED_WIDTH  128
+#define OLED_HEIGHT 64
 
-_Static_assert(MOTOR_MIN_PERCENT <= MOTOR_MAX_PERCENT && MOTOR_MAX_PERCENT <= 100U,
-               "Invalid motor PWM range");
+static const char *TAG = "DESK_CLOCK";
+static const char *const weekdays[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
 
-static const char *TAG = "hw_3_3";
-static adc_oneshot_unit_handle_t adc_handle;
+typedef struct {
+    int year;
+    int month;
+    int day;
+    int hour;
+    int minute;
+    int second;
+} clock_time_t;
 
-static void pwm_output_init(int pin, ledc_channel_t channel,
-                            ledc_timer_t timer, uint32_t frequency_hz,
-                            uint32_t initial_duty)
+// Перший байт 0x40 вказує SSD1306, що далі йдуть пікселі.
+static uint8_t oled_frame[1 + OLED_WIDTH * OLED_HEIGHT / 8] = {0x40};
+
+static const uint8_t digit_pixels[10][7] = {
+    {14, 17, 19, 21, 25, 17, 14}, {4, 12, 4, 4, 4, 4, 14},
+    {14, 17, 1, 2, 4, 8, 31},    {30, 1, 1, 14, 1, 1, 30},
+    {2, 6, 10, 18, 31, 2, 2},    {31, 16, 16, 30, 1, 1, 30},
+    {14, 16, 16, 30, 17, 17, 14},{31, 1, 2, 4, 8, 8, 8},
+    {14, 17, 17, 14, 17, 17, 14},{14, 17, 17, 15, 1, 1, 14},
+};
+
+static const uint8_t text_pixels[128][7] = {
+    [':'] = {0, 4, 4, 0, 4, 4, 0}, ['.'] = {0, 0, 0, 0, 0, 0, 4},
+    ['-'] = {0, 0, 0, 14, 0, 0, 0},
+    ['F'] = {31, 16, 16, 30, 16, 16, 16}, ['M'] = {17, 27, 21, 17, 17, 17, 17},
+    ['S'] = {15, 16, 16, 14, 1, 1, 30}, ['T'] = {31, 4, 4, 4, 4, 4, 4},
+    ['W'] = {17, 17, 17, 17, 21, 27, 17},
+    ['a'] = {0, 0, 14, 1, 15, 17, 15}, ['d'] = {1, 1, 15, 17, 17, 17, 15},
+    ['e'] = {0, 0, 14, 17, 31, 16, 14}, ['h'] = {16, 16, 30, 17, 17, 17, 17},
+    ['i'] = {4, 0, 12, 4, 4, 4, 14}, ['n'] = {0, 0, 30, 17, 17, 17, 17},
+    ['o'] = {0, 0, 14, 17, 17, 17, 14}, ['r'] = {0, 0, 22, 25, 16, 16, 16},
+    ['t'] = {8, 8, 30, 8, 8, 9, 6}, ['u'] = {0, 0, 17, 17, 17, 19, 13},
+};
+
+static int weekday_index(const clock_time_t *time)
 {
-    const ledc_timer_config_t timer_config = {
-        .speed_mode = PWM_MODE,
-        .duty_resolution = PWM_RESOLUTION,
-        .timer_num = timer,
-        .freq_hz = frequency_hz,
-        .clk_cfg = LEDC_AUTO_CLK,
+    struct tm calendar = {
+        .tm_year = time->year - 1900,
+        .tm_mon = time->month - 1,
+        .tm_mday = time->day,
     };
-    ESP_ERROR_CHECK(ledc_timer_config(&timer_config));
+    mktime(&calendar);
+    return calendar.tm_wday;
+}
 
-    const ledc_channel_config_t channel_config = {
-        .gpio_num = pin,
-        .speed_mode = PWM_MODE,
-        .channel = channel,
-        .intr_type = LEDC_INTR_DISABLE,
-        .timer_sel = timer,
-        .duty = initial_duty,
-        .hpoint = 0,
+static int from_bcd(uint8_t value)
+{
+    const int tens = value >> 4;
+    const int ones = value & 0x0f;
+    return (tens <= 9 && ones <= 9) ? tens * 10 + ones : -1;
+}
+
+static uint8_t to_bcd(int value)
+{
+    return (uint8_t)(((value / 10) << 4) | (value % 10));
+}
+
+static esp_err_t rtc_read(i2c_master_dev_handle_t rtc, clock_time_t *time)
+{
+    static const int days_in_month[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+    const uint8_t start_register = 0x00;
+    uint8_t registers[7];
+    esp_err_t result = i2c_master_transmit_receive(rtc, &start_register, 1, registers,
+                                                  sizeof(registers), I2C_TIMEOUT_MS);
+    if (result != ESP_OK) {
+        return result;
+    }
+
+    int hour = from_bcd(registers[2] & 0x3f);
+    if (registers[2] & 0x40) {
+        // У 12-годинному режимі біт 5 позначає PM.
+        const int hour_12 = from_bcd(registers[2] & 0x1f);
+        hour = (hour_12 >= 1 && hour_12 <= 12)
+             ? hour_12 % 12 + ((registers[2] & 0x20) ? 12 : 0)
+             : -1;
+    }
+
+    const clock_time_t value = {
+        .year = 2000 + from_bcd(registers[6]),
+        .month = from_bcd(registers[5] & 0x1f),
+        .day = from_bcd(registers[4] & 0x3f),
+        .hour = hour,
+        .minute = from_bcd(registers[1] & 0x7f),
+        .second = from_bcd(registers[0] & 0x7f),
     };
-    ESP_ERROR_CHECK(ledc_channel_config(&channel_config));
+
+    // CH = 1 означає зупинений генератор DS1307. Рік 2000 вважаємо заводським.
+    if ((registers[0] & 0x80) || value.year <= 2000 ||
+        value.month < 1 || value.month > 12 || value.day < 1 ||
+        value.hour < 0 || value.hour > 23 || value.minute < 0 || value.minute > 59 ||
+        value.second < 0 || value.second > 59) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    const int leap_day = value.month == 2 && value.year % 4 == 0;
+    if (value.day > days_in_month[value.month - 1] + leap_day) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    *time = value;
+    return ESP_OK;
 }
 
-static void adc_inputs_init(void)
+static esp_err_t rtc_set_build_time(i2c_master_dev_handle_t rtc)
 {
-    const adc_oneshot_unit_init_cfg_t unit_config = {
-        .unit_id = ADC_UNIT_1,
+    static const char months[] = "JanFebMarAprMayJunJulAugSepOctNovDec";
+    char month[4];
+    clock_time_t time;
+    if (sscanf(__DATE__, "%3s %d %d", month, &time.day, &time.year) != 3 ||
+        sscanf(__TIME__, "%d:%d:%d", &time.hour, &time.minute, &time.second) != 3) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    const char *month_position = strstr(months, month);
+    if (month_position == NULL || time.year < 2001 || time.year > 2099) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    time.month = (int)(month_position - months) / 3 + 1;
+
+    const uint8_t registers[] = {
+        0x00, to_bcd(time.second), to_bcd(time.minute), to_bcd(time.hour),
+        to_bcd(weekday_index(&time) + 1), to_bcd(time.day),
+        to_bcd(time.month), to_bcd(time.year - 2000),
     };
-    ESP_ERROR_CHECK(adc_oneshot_new_unit(&unit_config, &adc_handle));
+    ESP_LOGW(TAG, "RTC мав збитий час. Встановлюю час збірки: %s %s", __DATE__, __TIME__);
+    return i2c_master_transmit(rtc, registers, sizeof(registers), I2C_TIMEOUT_MS);
+}
 
-    const adc_oneshot_chan_cfg_t channel_config = {
-        .atten = ADC_ATTEN_DB_12,
-        .bitwidth = ADC_BITWIDTH_12,
+static esp_err_t oled_init(i2c_master_dev_handle_t oled)
+{
+    const uint8_t commands[] = {
+        0x00,       // Далі йдуть команди SSD1306.
+        0xAE,       // Вимкнути дисплей під час налаштування.
+        0xD5, 0x80, 0xA8, OLED_HEIGHT - 1, 0xD3, 0x00, 0x40,
+        0x8D, 0x14, // Увімкнути внутрішній перетворювач живлення OLED.
+        0x20, 0x00, // Горизонтальна адресація буфера.
+        0xA1, 0xC8, 0xDA, 0x12, 0x81, 0x7F, 0xD9, 0xF1, 0xDB, 0x40,
+        0xA4, 0xA6, 0x2E, 0xAF,
     };
-    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc_handle, POT_CHANNEL,
-                                             &channel_config));
-    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc_handle, LDR_CHANNEL,
-                                             &channel_config));
+    return i2c_master_transmit(oled, commands, sizeof(commands), I2C_TIMEOUT_MS);
 }
 
-static uint32_t ldr_to_led_duty(int value)
+static esp_err_t oled_show(i2c_master_dev_handle_t oled)
 {
-    if (value < 0) {
-        value = 0;
-    } else if (value > ADC_MAX_VALUE) {
-        value = ADC_MAX_VALUE;
+    const uint8_t address_window[] = {
+        0x00, 0x21, 0, OLED_WIDTH - 1, 0x22, 0, OLED_HEIGHT / 8 - 1,
+    };
+    esp_err_t result = i2c_master_transmit(oled, address_window, sizeof(address_window), I2C_TIMEOUT_MS);
+    if (result != ESP_OK) {
+        return result;
     }
-    return PWM_MAX_DUTY - (uint32_t)value * PWM_MAX_DUTY / ADC_MAX_VALUE;
+    return i2c_master_transmit(oled, oled_frame, sizeof(oled_frame), I2C_TIMEOUT_MS);
 }
 
-// Коротка діагностична вибірка самого GPIO, не вимірювач обертів.
-static unsigned motor_high_samples(void)
+static void fill_rect(int x, int y, int width, int height)
 {
-    unsigned high = 0;
-    for (unsigned i = 0; i < 256; ++i) {
-        high += gpio_get_level(MOTOR_PIN) != 0;
-        esp_rom_delay_us(1 + i % 13);
+    for (int row = y; row < y + height; row++) {
+        for (int col = x; col < x + width; col++) {
+            oled_frame[1 + (row / 8) * OLED_WIDTH + col] |= 1u << (row % 8);
+        }
     }
-    return high;
 }
 
-static uint32_t pot_to_motor_duty(int value)
+static void draw_centered(const char *text, int y, int scale)
 {
-    if (value < 0) {
-        value = 0;
-    } else if (value > ADC_MAX_VALUE) {
-        value = ADC_MAX_VALUE;
+    int width = ((int)strlen(text) * 6 - 1) * scale;
+    int x = (OLED_WIDTH - width) / 2;
+    for (const char *character = text; *character != '\0'; character++, x += 6 * scale) {
+        unsigned char symbol = (unsigned char)*character;
+        const uint8_t *pixels = symbol >= '0' && symbol <= '9'
+                              ? digit_pixels[symbol - '0'] : text_pixels[symbol];
+        for (int row = 0; row < 7; row++) {
+            for (int col = 0; col < 5; col++) {
+                if (pixels[row] & (1u << (4 - col))) {
+                    fill_rect(x + col * scale, y + row * scale, scale, scale);
+                }
+            }
+        }
     }
-    const uint32_t span = MOTOR_MAX_TICKS - MOTOR_MIN_TICKS;
-    return MOTOR_MIN_TICKS + ((uint32_t)value * span + ADC_MAX_VALUE / 2U) / ADC_MAX_VALUE;
 }
 
-static void motor_set_duty(uint32_t duty)
+static esp_err_t update_display(i2c_master_dev_handle_t oled, const clock_time_t *time, bool log_frame)
 {
-    if (duty >= PWM_PERIOD_TICKS) {
-        ESP_ERROR_CHECK(ledc_stop(PWM_MODE, MOTOR_CHANNEL, 1));
-    } else {
-        ESP_ERROR_CHECK(ledc_set_duty(PWM_MODE, MOTOR_CHANNEL, duty));
-        ESP_ERROR_CHECK(ledc_update_duty(PWM_MODE, MOTOR_CHANNEL));
+    char time_text[24];
+    char date_text[32];
+    snprintf(time_text, sizeof(time_text), "%02d:%02d:%02d", time->hour, time->minute, time->second);
+    snprintf(date_text, sizeof(date_text), "%s %02d.%02d.%04d",
+             weekdays[weekday_index(time)], time->day, time->month, time->year);
+    memset(&oled_frame[1], 0, sizeof(oled_frame) - 1);
+    draw_centered(time_text, 15, 2);
+    draw_centered(date_text, 40, 1);
+
+    esp_err_t result = oled_show(oled);
+    if (result == ESP_OK && log_frame) {
+        ESP_LOGI(TAG, "OLED: %s | %s", time_text, date_text);
     }
+    return result;
 }
 
 void app_main(void)
 {
-    pwm_output_init(MOTOR_PIN, MOTOR_CHANNEL, MOTOR_TIMER,
-                    MOTOR_FREQUENCY_HZ, MOTOR_MIN_TICKS);
-    ESP_ERROR_CHECK(gpio_input_enable(MOTOR_PIN));
-    pwm_output_init(LED_PIN, LED_CHANNEL, LED_TIMER, LED_FREQUENCY_HZ, 0);
-    adc_inputs_init();
+    vTaskDelay(pdMS_TO_TICKS(5000));
 
-    ESP_LOGI(TAG, "POT GPIO4 -> MOTOR GPIO7: %u..%u%% PWM; LDR GPIO5 -> LED GPIO6",
-             (unsigned)MOTOR_MIN_PERCENT, (unsigned)MOTOR_MAX_PERCENT);
-    ESP_LOGI(TAG, "Motor %u Hz, LED %u Hz",
-             (unsigned)ledc_get_freq(PWM_MODE, MOTOR_TIMER),
-             (unsigned)ledc_get_freq(PWM_MODE, LED_TIMER));
+    const i2c_master_bus_config_t bus_config = {
+        .clk_source = I2C_CLK_SRC_DEFAULT,
+        .i2c_port = I2C_NUM_0,
+        .sda_io_num = SDA_PIN,
+        .scl_io_num = SCL_PIN,
+        .glitch_ignore_cnt = 7,
+    };
+    i2c_master_bus_handle_t bus;
+    ESP_ERROR_CHECK(i2c_new_master_bus(&bus_config, &bus));
 
-    uint32_t motor_duty = MOTOR_MIN_TICKS;
-    TickType_t last_log = xTaskGetTickCount();
-    while (1) {
-        int pot_value = 0;
-        int ldr_value = 0;
-        esp_err_t pot_result = adc_oneshot_read(adc_handle, POT_CHANNEL, &pot_value);
-        esp_err_t ldr_result = adc_oneshot_read(adc_handle, LDR_CHANNEL, &ldr_value);
+    i2c_master_dev_handle_t rtc;
+    i2c_master_dev_handle_t oled;
+    i2c_device_config_t device_config = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address = RTC_ADDRESS,
+        .scl_speed_hz = I2C_SPEED_HZ,
+    };
+    ESP_ERROR_CHECK(i2c_master_bus_add_device(bus, &device_config, &rtc));
+    device_config.device_address = OLED_ADDRESS;
+    ESP_ERROR_CHECK(i2c_master_bus_add_device(bus, &device_config, &oled));
+    ESP_ERROR_CHECK(oled_init(oled));
 
-        // Потенціометр впливає лише на двигун; помилка його ADC вимикає двигун.
-        uint32_t target = pot_result == ESP_OK ? pot_to_motor_duty(pot_value) : 0;
-        if (target != motor_duty) {
-            motor_set_duty(target);
-            motor_duty = target;
-        }
-        // Фоторезистор впливає лише на LED: темніше -> яскравіше.
-        uint32_t led_duty = ldr_result == ESP_OK ? ldr_to_led_duty(ldr_value) : 0;
-        ESP_ERROR_CHECK(ledc_set_duty(PWM_MODE, LED_CHANNEL, led_duty));
-        ESP_ERROR_CHECK(ledc_update_duty(PWM_MODE, LED_CHANNEL));
+    clock_time_t current_time;
+    if (rtc_read(rtc, &current_time) == ESP_ERR_INVALID_STATE) {
+        ESP_ERROR_CHECK(rtc_set_build_time(rtc));
+    }
 
-        TickType_t now = xTaskGetTickCount();
-        if ((TickType_t)(now - last_log) >= pdMS_TO_TICKS(LOG_PERIOD_MS)) {
-            ESP_LOGI(TAG, "POT_GPIO4=%d MOTOR_GPIO7=%u/1024 (%u%%) PIN7_HIGH=%u/256 "
-                     "LDR_GPIO5=%d LED_GPIO6=%u/1023",
-                     pot_value, (unsigned)motor_duty,
-                     (unsigned)((motor_duty * 100U + PWM_PERIOD_TICKS / 2U) / PWM_PERIOD_TICKS),
-                     motor_high_samples(), ldr_value, (unsigned)led_duty);
-            if (pot_result != ESP_OK) {
-                ESP_LOGW(TAG, "POT ADC read failed: %s", esp_err_to_name(pot_result));
+    int last_second = -1;
+    int logged_frames = 0;
+    esp_err_t last_error = ESP_OK;
+    while (true) {
+        esp_err_t result = rtc_read(rtc, &current_time);
+        if (result == ESP_OK && current_time.second != last_second) {
+            result = update_display(oled, &current_time, logged_frames < 2);
+            if (result == ESP_OK) {
+                last_second = current_time.second;
+                if (logged_frames < 2) {
+                    logged_frames++;
+                }
             }
-            if (ldr_result != ESP_OK) {
-                ESP_LOGW(TAG, "LDR ADC read failed: %s", esp_err_to_name(ldr_result));
-            }
-            last_log = now;
         }
-        vTaskDelay(pdMS_TO_TICKS(UPDATE_PERIOD_MS));
+        if (result != ESP_OK && result != last_error) {
+            ESP_LOGW(TAG, "Помилка RTC або OLED: %s", esp_err_to_name(result));
+            memset(&oled_frame[1], 0, sizeof(oled_frame) - 1);
+            draw_centered("--:--:--", 15, 2);
+            oled_show(oled);
+            last_second = -1;
+        }
+        last_error = result;
+        vTaskDelay(pdMS_TO_TICKS(150));
     }
 }
